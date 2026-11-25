@@ -24,18 +24,29 @@ def window_of(history: History, now: float, size: float) -> list[Point]:
     the right.  Samples are returned in ascending timestamp order and the
     sample at ``now`` is not part of the window.
     """
-    count = int(size)
-    if count <= 0:
+    if float(size) <= 0.0:
         return []
-    return list(history)[-count:]
+
+    now = float(now)
+    lower = now - float(size)
+    points = [
+        (float(timestamp), float(value))
+        for timestamp, value in history
+        if lower <= float(timestamp) < now
+    ]
+    points.sort(key=lambda point: point[0])
+    return points
 
 
 def median(values: Iterable[float]) -> float:
     """Return the median of a non-empty sequence of numbers."""
-    data = [float(item) for item in values]
+    data = sorted(float(item) for item in values)
     if not data:
         raise ValueError("median requires at least one value")
-    return sum(data) / len(data)
+    middle = len(data) // 2
+    if len(data) % 2:
+        return data[middle]
+    return (data[middle - 1] + data[middle]) / 2.0
 
 
 def quantile(values: Iterable[float], q: float) -> float:
@@ -49,8 +60,11 @@ def quantile(values: Iterable[float], q: float) -> float:
     data = sorted(float(item) for item in values)
     if not data:
         raise ValueError("quantile requires at least one value")
-    index = min(int(q * (len(data) - 1)), len(data) - 1)
-    return data[index]
+    position = q * (len(data) - 1)
+    lower = int(floor(position))
+    upper = min(lower + 1, len(data) - 1)
+    fraction = position - lower
+    return data[lower] + (data[upper] - data[lower]) * fraction
 
 
 def baseline(history: History, now: float, size: float) -> dict[str, float | int]:
@@ -78,12 +92,15 @@ def is_anomaly(
     """Return whether ``value`` reaches the policy threshold for ``base``.
 
     The threshold is the configured multiple of the baseline upper quantile.
-    A value equal to the threshold is a deviation.
+    A value equal to the threshold is a deviation.  A baseline that carries a
+    zero sample count has no reference and cannot flag a deviation.
     """
+    if "count" in base and int(base["count"]) <= 0:
+        return False
     factor = float(policy.get("factor", 1.5))
     upper = float(base.get("upper", 0.0))
     threshold = upper * factor
-    return bool(value > threshold)
+    return bool(value >= threshold)
 
 
 def update_baseline(
@@ -100,17 +117,40 @@ def update_baseline(
     the reference statistics.
     """
     result = dict(base)
+    value = float(value)
     refresh = max(1, int(policy.get("refresh", 1)))
+    freeze = int(policy.get("freeze", 0) or 0)
+
+    freeze_left = int(result.get("freeze_left", 0))
+    if freeze_left > 0:
+        result["freeze_left"] = freeze_left - 1
+        return result
+
+    has_reference = "count" not in result or int(result["count"]) > 0
+    if has_reference and is_anomaly(value, result, policy):
+        result["freeze_left"] = freeze
+        result["pending"] = 0
+        return result
+
     pending = int(result.get("pending", 0)) + 1
     if pending < refresh:
         result["pending"] = pending
         return result
 
     result["pending"] = 0
+    result["freeze_left"] = 0
+
+    old_median = float(result.get("median", 0.0))
     old_upper = float(result.get("upper", 0.0))
-    result["median"] = float(value)
-    result["upper"] = max(old_upper, float(value))
-    result["freeze_left"] = int(result.get("freeze_left", 0))
+
+    max_step = policy.get("max_step")
+    step = None if max_step is None else max(0.0, float(max_step))
+
+    median_value = value if step is None else min(value, old_median + step)
+    upper_value = value if step is None else min(value, old_upper + step)
+
+    result["median"] = median_value
+    result["upper"] = max(old_upper, upper_value, median_value)
     return result
 
 
@@ -124,7 +164,7 @@ def validate_config(policy: Mapping[str, Any]) -> list[str]:
     except (TypeError, ValueError):
         issues.append("factor must be a number greater than one")
     else:
-        if factor_value == 1.0:
+        if factor_value <= 1.0:
             issues.append("factor must be greater than one")
 
     freeze = policy.get("freeze")
@@ -160,14 +200,13 @@ def anomaly_batch(
     """
     result: dict[str, bool] = {}
     window = float(policy.get("window", 0.0))
-    reference: dict[str, Any] | None = None
 
     for name, history in entities.items():
-        if reference is None:
-            reference = baseline(history, now, window)
-        current = _value_at(history, now)
+        records = list(history)
+        current = _value_at(records, now)
         if current is None:
             continue
+        reference = baseline(records, now, window)
         result[name] = is_anomaly(current, reference, policy)
 
     return result
